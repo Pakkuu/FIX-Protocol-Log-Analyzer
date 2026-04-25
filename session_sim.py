@@ -1,5 +1,6 @@
 """FIX 4.4 SPY equity session simulator — full order lifecycle, prints every 3s."""
 
+import os
 import random
 import signal
 import sys
@@ -8,12 +9,18 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+import paramiko
 import simplefix
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SENDER, TARGET, ACCOUNT = "ALGO_DESK", "EQUITY_GW", "SPY-EQ-01"
 SYMBOL, EXCHANGE        = "SPY", "ARCA"
 INTERVAL                = 3
+
+# Remote log target (EC2 via SSH alias from ~/.ssh/config)
+REMOTE_HOST     = "fix-analyzer"
+REMOTE_LOG_PATH = "/home/ubuntu/fix-analyzer/logs/fix-session.log"
+SSH_KEY_PATH    = os.path.expanduser("~/downloads/fix-parser-kp.pem")
 
 # Colours
 R, B, D = "\033[0m", "\033[1m", "\033[2m"
@@ -236,13 +243,99 @@ def display(msg: simplefix.FixMessage, direction: str, type_label: str, summary:
     for tag, val in pairs:
         print(f"    {MAG}{tag:>5}{R}={WHT}{val}{R}")
 
+# ── Remote log ───────────────────────────────────────────────────────────────
+class RemoteLog:
+    """Persistent SFTP connection that appends raw FIX frames to a remote file."""
+
+    def __init__(self) -> None:
+        self._ssh:  paramiko.SSHClient | None = None
+        self._sftp: paramiko.SFTPClient | None = None
+        self._fh:   paramiko.SFTPFile | None = None
+
+    def connect(self) -> bool:
+        """Open SSH → SFTP → remote file.  Returns True on success."""
+        try:
+            client = paramiko.SSHClient()
+            client.load_system_host_keys()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(
+                hostname=REMOTE_HOST,
+                username="ubuntu",
+                key_filename=SSH_KEY_PATH,
+                timeout=10,
+            )
+            sftp = client.open_sftp()
+
+            # Ensure the remote directory exists
+            remote_dir = REMOTE_LOG_PATH.rsplit("/", 1)[0]
+            try:
+                sftp.stat(remote_dir)
+            except FileNotFoundError:
+                # mkdir -p equivalent over SFTP
+                parts = remote_dir.lstrip("/").split("/")
+                path  = ""
+                for part in parts:
+                    path += f"/{part}"
+                    try:
+                        sftp.stat(path)
+                    except FileNotFoundError:
+                        sftp.mkdir(path)
+
+            fh = sftp.open(REMOTE_LOG_PATH, "ab")  # append-binary
+            fh.set_pipelined(True)                  # buffer writes for speed
+
+            self._ssh, self._sftp, self._fh = client, sftp, fh
+            return True
+        except Exception as exc:  # noqa: BLE001
+            print(f"\n  {YELLOW}⚠ Remote log unavailable: {exc}{R}")
+            return False
+
+    def write(self, raw: bytes) -> None:
+        """Append one raw FIX frame (+ newline) to the remote file."""
+        if self._fh is None:
+            return
+        try:
+            self._fh.write(raw + b"\n")
+        except OSError as exc:
+            print(f"\n  {YELLOW}⚠ Remote write failed: {exc} — reconnecting…{R}")
+            self.close()
+            self.connect()
+
+    def close(self) -> None:
+        for obj in (self._fh, self._sftp, self._ssh):
+            try:
+                if obj is not None:
+                    obj.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._fh = self._sftp = self._ssh = None
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
-    signal.signal(signal.SIGINT, lambda *_: (print(f"\n{YELLOW}Stopped.{R}\n"), sys.exit(0)))
+    remote_log = RemoteLog()
+
+    def _shutdown(*_: object) -> None:
+        print(f"\n{YELLOW}Stopped.{R}\n")
+        remote_log.close()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _shutdown)
+
     print(f"\n{B}{CYAN}FIX 4.4 SPY Session Simulator{R}  {D}{SENDER} ⟷ {TARGET}  |  Ctrl+C to stop{R}")
     print(f"  {D}{GREEN}→ outbound (us → exchange){R}   {BLUE}← inbound (exchange → us){R}")
+
+    # Connect to remote log (non-fatal if unreachable)
+    if remote_log.connect():
+        print(f"  {D}Remote log → {REMOTE_LOG_PATH}{R}")
+    else:
+        print(f"  {D}{YELLOW}Running without remote log.{R}")
+
     while True:
-        display(*next_tick())
+        msg, direction, type_label, summary = next_tick()
+        raw = msg.encode()
+        display(msg, direction, type_label, summary)
+        remote_log.write(raw)
         time.sleep(INTERVAL)
 
 if __name__ == "__main__":
