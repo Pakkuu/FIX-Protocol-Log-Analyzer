@@ -100,7 +100,7 @@ wheels = [
 ]
 
 [[package]]
-name = "fix-protocol-log-analyzer"
+name = "fix-simulator"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
